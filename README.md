@@ -114,7 +114,7 @@ To add it: free key at `fred.stlouisfed.org/docs/api/api_key.html`, then **Setti
 
 Read two things in the log.
 
-**The Self-test step** should print `35/35 checks passed`. It runs entirely offline, before the fetch, so if it fails the problem is the code, not the network - and nothing was written.
+**The Self-test step** should print `46/46 checks passed`. It runs entirely offline, before the fetch, so if it fails the problem is the code, not the network - and nothing was written.
 
 **`sources_failed` in the Fetch output.** It should be empty or close to it. A name in there means that column is blank for the week, which is survivable - the run still succeeds. **If every quoted column fails at once while crypto and FX are fine, that is a source blocking the runner by IP, not a symbol problem** - see the troubleshooting table.
 
@@ -122,7 +122,11 @@ Then run it again **without** dry run. `data/series.csv` and `data/brief-block.m
 
 > **Expected on the first real run: every delta in the block reads `-`.** There is one row, so there is nothing to compare against. Week two is when the file starts being useful.
 
-> **And expected on any *second* run in the same ISO week: `nothing to commit`.** That is the idempotence guard working, not a failure. The run exits 0. The next real data point is the next scheduled Saturday.
+> **A second run in the same ISO week collects nothing by design** - one row per week is the contract. It still **regenerates the block from the CSV**, so the two can never drift, but the numbers do not change.
+>
+> ⚠️ **To fix a week after repairing a source, tick `repair` on Run workflow.** It fills **only the blank fields** and leaves every value that is already there alone.
+>
+> **Why repair rather than replace, and it is not a preference.** A full replace re-reads sources that already worked, which does two unwanted things: it overwrites a good reading with a later one, and - the decisive one - **it can BLANK a good field if that source happens to be down at the moment of the repair.** Repair cannot make the row worse. Replace can. `force` still exists for a deliberate fresh snapshot, but `repair` is the right tool for a broken column.
 
 ⚠️ **Always start a run with "Run workflow" on the workflow page. Never "Re-run jobs" on a previous run** - a re-run replays the original commit, so it uses the tree *and the workflow file* as they were then. That produces two confusing symptoms at once: stale action versions in the log, and a push rejected because the branch has moved on since.
 
@@ -144,6 +148,8 @@ Then run it again **without** dry run. `data/series.csv` and `data/brief-block.m
 | `data/` folder never appears | **Dry run was ticked** - it writes nothing, by design | Run again with the box unticked |
 | **Every quoted column `n/a`, crypto and FX fine** | A quote source is blocking the runner by IP. Happened to Stooq on 13 Sept 2026 - all eight symbols failed while every other source succeeded | Fixed: quotes now try **Yahoo first, Stooq second**. If both ever fail together, reorder `QUOTE_SOURCES` or add a third |
 | A column is blank but its source looks up fine by hand | The value failed its **sanity band** and was rejected rather than stored | Check `SANE` in `fetch.py`. Rejection is deliberate - a wrong number is worse than a blank |
+| Run is clean but **the table does not change** | This ISO week is already recorded, so nothing was collected | Re-run with **`repair` ticked** to fill the blank columns |
+| Some columns filled, others still `n/a` after a repair | Those sources are genuinely down. Repair reports exactly which it filled and which stayed blank, and exits non-zero if any remain | Check the named sources. The filled columns are kept regardless |
 | Yellow "Node.js 20 is deprecated" notice | Action majors still target Node 20 | Cosmetic, the job runs. Fixed in this version: **checkout@v5, setup-python@v6** |
 
 ---
@@ -197,8 +203,10 @@ Slow rot is the real risk with an unattended collector: a source changes its sch
 
 ```bash
 python fetch.py              # collect, append, regenerate the block
+python fetch.py --repair     # fill ONLY the blank fields in this week's row
+python fetch.py --force      # replace this week's row entirely (fresh snapshot)
 python fetch.py --dry-run    # fetch and print, write nothing
-python fetch.py --selftest   # 35 checks, offline, no network
+python fetch.py --selftest   # 46 checks, offline, no network
 ```
 
 The self-test covers parsing, the EUR/USD inversion, the stablecoin sum, FRED overwriting Stooq yields when the key is present, **a full collection run with no key at all** (EFFR and the target range survive, yields fall back to Stooq, nothing goes blank, and the absent key is not logged as a failure), partial-failure handling, blank-not-zero, ISO-week stamping, schema alignment across appends, idempotence, delta computation up and down, the target-range render, and the formatting edges. It deliberately fails one source so the partial-failure path is exercised rather than assumed, and the Stooq and FRED yield fixtures carry **different values** so the fallback checks actually discriminate.

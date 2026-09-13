@@ -307,6 +307,68 @@ def append(row):
         w.writerow(row)
 
 
+def replace_week(row):
+    """Rewrite the file with this ISO week's row swapped for a fresh one.
+
+    One row per ISO week is the contract, so a re-run inside the same week
+    must UPDATE that week rather than append a duplicate or refuse to run.
+    This is what makes a source fix recoverable without waiting for the next
+    Saturday - which is exactly the hole the plain idempotence guard left."""
+    rows = read_rows()
+    out = [row if r.get("iso_week") == row["iso_week"] else r for r in rows]
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(out)
+
+
+DATA_FIELDS = [f for f in FIELDS
+               if f not in ("date", "iso_week", "sources_ok", "sources_failed")]
+
+
+def blanks_in(existing):
+    return [f for f in DATA_FIELDS if existing.get(f) in (None, "")]
+
+
+def repair_week(iso_week, rows, http=requests, when=None):
+    """Fill ONLY the fields that are currently blank. Never touch a value
+    that is already there.
+
+    A full replace would re-read sources that worked and overwrite good data
+    with a later reading - and, worse, could BLANK a good field if that
+    source happens to be down at the moment of the repair. Repair cannot make
+    the row worse; replace can. So repair is the default for a same-week
+    re-run and --force is the explicit opt-in to a whole fresh snapshot.
+    """
+    existing = next(r for r in rows if r.get("iso_week") == iso_week)
+    missing = blanks_in(existing)
+    if not missing:
+        return existing, [], []
+
+    fresh = collect(http, when=when)
+    filled = [f for f in missing if fresh.get(f) not in (None, "")]
+
+    merged = dict(existing)
+    for f in filled:
+        merged[f] = fresh[f]
+    still_blank = [f for f in missing if f not in filled]
+    merged["sources_failed"] = ";".join(still_blank)
+    merged["sources_ok"] = len([f for f in DATA_FIELDS
+                                if merged.get(f) not in (None, "")])
+    return merged, filled, still_blank
+
+
+def write_block():
+    """Always regenerate from whatever is in the CSV. The block is DERIVED,
+    so it must never be allowed to drift from the file it is derived from -
+    including on a run that collects nothing."""
+    rows = read_rows()
+    if rows:
+        BLOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BLOCK_PATH.write_text(render_block(rows), encoding="utf-8")
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Brief block
 # ---------------------------------------------------------------------------
@@ -559,6 +621,48 @@ def selftest():
     check("week count stated", "2 weeks on record" in block)
     check("target range rendered", "| FOMC target range | 3.50-3.75% |" in block)
 
+    print("Self-test: force-replace and block refresh")
+    successes, failures = [], []
+    before = len(read_rows())
+    r2b = collect(http, when=datetime(2026, 9, 19, tzinfo=timezone.utc))
+    r2b["btc_usd"] = 90000.0
+    replace_week(r2b)
+    rows2 = read_rows()
+    check("force replaces, does not append", len(rows2) == before)
+    check("replaced row carries the new value",
+          rows2[-1]["btc_usd"] == "90000.0")
+    check("earlier week untouched", rows2[0]["iso_week"] == "2026-W37")
+    check("column order preserved after rewrite",
+          list(rows2[0].keys()) == FIELDS and list(rows2[1].keys()) == FIELDS)
+    write_block()
+    check("block refreshed from the rewritten CSV",
+          "$90,000" in BLOCK_PATH.read_text())
+
+    print("Self-test: repair fills blanks and touches nothing else")
+    successes, failures = [], []
+    rows_now = read_rows()
+    target = rows_now[-1]["iso_week"]
+    # Blank one field that HAS a value and keep a known-good one to compare.
+    good_btc = rows_now[-1]["btc_usd"]
+    rows_now[-1]["gold_usd"] = ""
+    rows_now[-1]["btc_usd"] = "12345.0"      # a value repair must NOT overwrite
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        w.writeheader(); w.writerows(rows_now)
+
+    merged, filled, still = repair_week(
+        target, read_rows(), http, when=datetime(2026, 9, 19, tzinfo=timezone.utc))
+    check("repair fills the blank field", merged["gold_usd"] == 3420.0)
+    check("repair does NOT overwrite an existing value",
+          merged["btc_usd"] == "12345.0")
+    check("repair reports what it filled", filled == ["gold_usd"])
+    check("repair leaves genuinely dead fields blank",
+          merged["brent_usd"] == "" and "brent_usd" in still)
+    replace_week(merged)
+    check("repair does not add a row", len(read_rows()) == len(rows_now))
+    m2, filled2, _ = repair_week(target, read_rows(), http)
+    check("repair is a no-op when only dead fields remain", filled2 == [])
+
     print("Self-test: formatting edges")
     check("pct handles blank", pct("", "100") == "")
     check("pct flags unchanged as flat", pct("100", "100") == "flat")
@@ -601,6 +705,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
                     help="fetch and print, write nothing")
+    ap.add_argument("--repair", action="store_true",
+                    help="fill only the BLANK fields in this week's row, "
+                         "leaving every value that is already there alone")
+    ap.add_argument("--force", action="store_true",
+                    help="re-collect and REPLACE this week's row entirely "
+                         "(a fresh snapshot - can blank a field whose source "
+                         "is down; prefer --repair)")
     ap.add_argument("--selftest", action="store_true",
                     help="run the pipeline offline against fixtures")
     args = ap.parse_args()
@@ -613,8 +724,33 @@ def main():
     iso_week = f"{y}-W{w:02d}"
     rows = read_rows()
 
-    if already_recorded(iso_week, rows) and not args.dry_run:
-        print(f"{iso_week} already recorded - nothing to do.")
+    recorded = already_recorded(iso_week, rows)
+
+    # REPAIR: same week, blanks present, and not an explicit full replace.
+    if recorded and args.repair and not args.dry_run and not args.force:
+        existing = next(r for r in rows if r.get("iso_week") == iso_week)
+        missing = blanks_in(existing)
+        if not missing:
+            write_block()
+            print(f"{iso_week} has no blank fields - nothing to repair.")
+            return 0
+        print(f"Repairing {iso_week}: {len(missing)} blank field(s) "
+              f"-> {', '.join(missing)}")
+        merged, filled, still_blank = repair_week(iso_week, rows)
+        replace_week(merged)
+        rows = write_block()
+        print(f"Filled {len(filled)}: {', '.join(filled) or 'none'}. "
+              f"Still blank: {', '.join(still_blank) or 'none'}. "
+              f"Untouched fields kept their original values.")
+        return 0 if not still_blank else 1
+
+    if recorded and not args.dry_run and not args.force:
+        # Regenerate the block even so: it is derived from the CSV and must
+        # not be allowed to go stale behind a no-op.
+        write_block()
+        print(f"{iso_week} already recorded - nothing collected. "
+              f"Block refreshed from {len(rows)} row(s). "
+              f"Use --repair to fill blanks, --force for a fresh snapshot.")
         return 0
 
     print(f"Collecting for {iso_week} ...")
@@ -632,10 +768,14 @@ def main():
         print("Both core blocks failed - not writing a row.", file=sys.stderr)
         return 1
 
-    append(row)
-    rows = read_rows()
-    BLOCK_PATH.write_text(render_block(rows), encoding="utf-8")
-    print(f"Wrote {iso_week}: {len(successes)} ok, {len(failures)} failed. "
+    if recorded:
+        replace_week(row)
+        verb = "Replaced"
+    else:
+        append(row)
+        verb = "Wrote"
+    rows = write_block()
+    print(f"{verb} {iso_week}: {len(successes)} ok, {len(failures)} failed. "
           f"{len(rows)} weeks on record.")
 
     if crypto_dead or fx_dead:
