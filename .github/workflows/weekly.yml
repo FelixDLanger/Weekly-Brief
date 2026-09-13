@@ -25,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history, so the rebase in the Commit step below can
+          # actually replay onto the remote. A shallow clone cannot.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -57,10 +61,31 @@ jobs:
       - name: Commit
         if: ${{ inputs.dry_run != true }}
         run: |
+          set -euo pipefail
           git config user.name  "series-bot"
           git config user.email "series-bot@users.noreply.github.com"
           git add data/series.csv data/brief-block.md
           # No change means this week was already recorded - exit cleanly.
-          git diff --staged --quiet && echo "nothing to commit" && exit 0
+          # Written as an if, NOT as an && chain: under `set -e` a failing
+          # `git diff --quiet` (which is what "there ARE changes" looks like)
+          # would abort the whole step.
+          if git diff --staged --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
           git commit -m "data: week $(date -u +%G-W%V)"
-          git push
+
+          # The remote can move between checkout and push: a web-UI edit, an
+          # overlapping run, or a "Re-run jobs" replaying an older commit.
+          # Rebase onto whatever is there and retry rather than failing a run
+          # whose data was collected correctly.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected on attempt $attempt - rebasing onto origin/${GITHUB_REF_NAME}"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+          done
+          echo "push still failing after 3 attempts" >&2
+          exit 1
