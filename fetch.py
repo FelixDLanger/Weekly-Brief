@@ -15,9 +15,12 @@ deltas, formatted for section 3 of the brief.
 Design rules:
   - NO API KEY IS REQUIRED FOR ANY COLUMN. One optional secret exists
     (FRED_API_KEY) and every field it touches has a keyless fallback:
-    without it the two Treasury yields come from Stooq instead of the
-    official series, and nothing else changes. EFFR and the FOMC target
-    range come from the New York Fed, keyless.
+    without it the two Treasury yields come from the public quote chain
+    instead of the official series, and nothing else changes. EFFR and the
+    FOMC target range come from the New York Fed, keyless.
+  - Every quoted series has TWO sources tried in order (Yahoo, then Stooq)
+    and a plausible-range check. A value outside its band is rejected rather
+    than stored: a blank is recoverable, a silently wrong number is not.
   - Individual source failures are tolerated: the field is written empty and
     named in sources_failed. Losing a WHOLE block (crypto or fx) fails the run.
   - Idempotent per ISO week. Re-running on the same Saturday is a no-op.
@@ -139,6 +142,28 @@ def fetch_fx(row, http=requests):
         fail("frankfurter/fx", e)
 
 
+def yahoo_last_close(symbol, http=requests):
+    """Yahoo chart endpoint. Free, no key, and - unlike Stooq - it answers
+    requests from cloud datacentre IP ranges, which is what GitHub runners
+    have. This is the PRIMARY source as of 13 Sept 2026."""
+    r = http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                 params={"range": "5d", "interval": "1d"},
+                 headers=UA, timeout=TIMEOUT)
+    r.raise_for_status()
+    res = r.json()["chart"]["result"][0]
+    price = res["meta"].get("regularMarketPrice")
+    if price in (None, ""):
+        raise ValueError("no regularMarketPrice in meta")
+    v = float(price)
+    # ^TNX and ^TYX have historically been quoted at ten times the yield.
+    # Yahoo now serves the plain percentage, but the convention has flipped
+    # before, so normalise rather than trust it. The SANE band below is the
+    # backstop if it ever flips again in the other direction.
+    if symbol in ("^TNX", "^TYX") and v > 20:
+        v = v / 10.0
+    return v
+
+
 def stooq_last_close(symbol, http=requests):
     r = http.get("https://stooq.com/q/l/",
                  params={"s": symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"},
@@ -153,27 +178,60 @@ def stooq_last_close(symbol, http=requests):
     return float(close)
 
 
-STOOQ_SYMBOLS = {
-    "sap_adr":   "sap.us",
-    "gme":       "gme.us",
-    "nvda":      "nvda.us",
-    "set_index": "^set",       # Thai SET. Verify on run one - see README.
-    "gold_usd":  "xauusd",
-    "brent_usd": "cb.f",
-    "us10y":     "10usy.b",
-    "us30y":     "30usy.b",
+# Ordered fallback per field. Yahoo first because Stooq returned nothing at
+# all from the GitHub runner on 13 Sept 2026 - all eight symbols failed while
+# every other source succeeded, which is the signature of an IP-range block
+# rather than a symbol problem. Stooq is kept as the second source because it
+# works from other environments and a second source is the whole point.
+QUOTE_SOURCES = {
+    "sap_adr":   [("yahoo", "SAP"),      ("stooq", "sap.us")],
+    "gme":       [("yahoo", "GME"),      ("stooq", "gme.us")],
+    "nvda":      [("yahoo", "NVDA"),     ("stooq", "nvda.us")],
+    "set_index": [("yahoo", "^SET.BK"),  ("stooq", "^set")],
+    "gold_usd":  [("yahoo", "GC=F"),     ("stooq", "xauusd")],
+    "brent_usd": [("yahoo", "BZ=F"),     ("stooq", "cb.f")],
+    "us10y":     [("yahoo", "^TNX"),     ("stooq", "10usy.b")],
+    "us30y":     [("yahoo", "^TYX"),     ("stooq", "30usy.b")],
 }
 
+# Plausible ranges. A value outside its band is REJECTED, not stored - a
+# silently wrong number is far worse than a blank, and a source changing its
+# scale or its symbol meaning is exactly how that happens.
+SANE = {
+    "sap_adr":   (20, 2000),
+    "gme":       (0.5, 2000),
+    "nvda":      (1, 10000),
+    "set_index": (100, 10000),
+    "gold_usd":  (200, 20000),
+    "brent_usd": (5, 500),
+    "us10y":     (0.1, 20),
+    "us30y":     (0.1, 20),
+}
 
-def fetch_stooq(row, http=requests):
-    """Individually tolerant. A blank column for one week is not a problem;
-    a silently wrong column would be."""
-    for field, sym in STOOQ_SYMBOLS.items():
-        try:
-            row[field] = stooq_last_close(sym, http)
-            ok(f"stooq/{sym}")
-        except Exception as e:
-            fail(f"stooq/{sym}", e)
+FETCHERS = {"yahoo": yahoo_last_close, "stooq": stooq_last_close}
+
+
+def fetch_quotes(row, http=requests):
+    """Try each source in order, take the first value that passes its sanity
+    band, and name the source that actually supplied it. Individually
+    tolerant: a blank column for one week is not a problem; a silently wrong
+    column would be."""
+    for field, sources in QUOTE_SOURCES.items():
+        errors = []
+        for name, sym in sources:
+            try:
+                v = FETCHERS[name](sym, http)
+                lo, hi = SANE[field]
+                if not (lo <= v <= hi):
+                    raise ValueError(
+                        f"{v} outside sane band {lo}-{hi} for {field}")
+                row[field] = v
+                ok(f"{name}/{sym}")
+                break
+            except Exception as e:
+                errors.append(f"{name}/{sym}: {e}")
+        else:
+            fail(field, " | ".join(errors))
 
 
 def fetch_nyfed(row, http=requests):
@@ -376,13 +434,25 @@ class _FakeHTTP:
         if "frankfurter" in url:
             return _Resp({"rates": {"THB": 32.41, "SGD": 1.2845,
                                     "EUR": 0.9174}})
+        if "query1.finance.yahoo.com" in url:
+            sym = url.rsplit("/", 1)[-1]
+            # GC=F and BZ=F fail so the FALLBACK path is exercised, not assumed.
+            if sym in ("GC=F", "BZ=F"):
+                raise RuntimeError("simulated primary outage")
+            prices = {
+                "SAP": 216.00, "GME": 21.50, "NVDA": 180.00,
+                "^SET.BK": 1200.00,
+                "^TNX": 43.12,   # the x10 convention - must normalise to 4.312
+                "^TYX": 999.0,   # absurd - must be REJECTED by the sane band
+            }
+            return _Resp({"chart": {"result": [
+                {"meta": {"regularMarketPrice": prices[sym]}}]}})
         if "stooq.com" in url:
             sym = params.get("s")
-            if sym == "cb.f":                      # forced failure
+            if sym == "cb.f":       # both sources down for brent -> blank
                 raise RuntimeError("simulated source outage")
             # Yields deliberately DIFFER from the FRED fixture so the
-            # "FRED overwrites Stooq" and "no key falls back to Stooq"
-            # checks actually discriminate.
+            # "FRED overwrites" and "no key" checks actually discriminate.
             prices = {"sap.us": 214.30, "gme.us": 21.15, "nvda.us": 178.42,
                       "^set": 1198.40, "xauusd": 3420.0,
                       "10usy.b": 4.28, "30usy.b": 4.81}
@@ -435,8 +505,15 @@ def selftest():
     check("ffr collected from NY Fed", r1["ffr"] == 3.63)
     check("fed target range captured",
           r1["fed_target_lo"] == 3.5 and r1["fed_target_hi"] == 3.75)
-    check("forced failure captured", "stooq/cb.f" in r1["sources_failed"])
-    check("brent left blank, not zero", r1["brent_usd"] == "")
+    check("primary source used when it works", r1["sap_adr"] == 216.00)
+    check("falls back when primary fails", r1["gold_usd"] == 3420.0)
+    check("both sources down leaves the field blank, not zero",
+          r1["brent_usd"] == "" and "brent_usd" in r1["sources_failed"])
+    check("yield x10 convention normalised at source",
+          abs(yahoo_last_close("^TNX", http) - 4.312) < 1e-6)
+    check("plain-percent yield left alone",
+          yahoo_last_close("SAP", http) == 216.00)
+    check("out-of-band value REJECTED, fallback used", r1["us30y"] == 4.88)
     check("iso_week stamped", r1["iso_week"] == "2026-W37")
     check("no unexpected columns", set(r1) <= set(FIELDS))
 
@@ -448,7 +525,9 @@ def selftest():
     rk = collect(http, when=datetime(2026, 9, 12, tzinfo=timezone.utc))
     check("ffr survives with no secret", rk["ffr"] == 3.63)
     check("target range survives with no secret", rk["fed_target_hi"] == 3.75)
-    check("yields fall back to Stooq", rk["us10y"] == 4.28 and rk["us30y"] == 4.81)
+    check("yield x10 normalised, no key", abs(rk["us10y"] - 4.312) < 1e-6)
+    check("absurd yield rejected, second source used, no key",
+          rk["us30y"] == 4.81)
     check("no column goes blank without the key",
           all(rk[f] != "" for f in ("ffr", "us10y", "us30y")))
     check("absent key is not logged as a failure",
@@ -509,7 +588,7 @@ def collect(http=requests, when=None):
 
     fetch_coingecko(row, http)
     fetch_fx(row, http)
-    fetch_stooq(row, http)
+    fetch_quotes(row, http)
     fetch_nyfed(row, http)
     fetch_fred(row, http)
 

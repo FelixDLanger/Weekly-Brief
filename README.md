@@ -9,6 +9,7 @@ One row per ISO week, appended to `data/series.csv` by GitHub Actions, plus a re
 | Schedule | daily, 09:15 Bangkok | **weekly, Saturday 08:30 Bangkok** - before the brief |
 | Output | `series.csv` only | `series.csv` **plus a paste-ready brief block with week-over-week deltas** |
 | Safety | none | **`--selftest` runs offline before every live fetch; the job stops if the logic is broken** |
+| Quote sources | Stooq only | **Two per field, tried in order, plus a sanity band that rejects out-of-range values** |
 | New series | - | `ffr` + `fed_target_lo/hi` (NY Fed, keyless), `set_index` (Thai SET), `iso_week` |
 | Secrets | one, load-bearing | **one, optional - no column depends on it** |
 
@@ -36,7 +37,8 @@ Do this now if you are unsure. Storage is free and the decision is only reversib
 | Actions on a **private** repo | Free tier | 2,000 min/month. This job takes ~40s → ~3 min/month |
 | CoinGecko public API | Free, no key | ~10-30 calls/min. We make **2 calls/week** |
 | Frankfurter (ECB rates) | Free, no key | None published. **1 call/week** |
-| Stooq CSV quotes | Free, no key | Informal. **8 small calls/week** |
+| Yahoo chart API | Free, no key | Informal. **8 calls/week** - primary for quotes |
+| Stooq CSV quotes | Free, no key | Fallback only. Zero calls in a week where Yahoo answers |
 | NY Fed markets API | Free, no key | None published. **1 call/week** |
 | FRED | Free, optional key | 120 req/min. **2 calls/week**, skipped if no key |
 
@@ -95,8 +97,8 @@ Via the web UI: **Add file → Create new file**, paste the full path including 
 |---|---|---|
 | `ffr` (EFFR) | **New York Fed markets API** | unchanged |
 | `fed_target_lo` / `fed_target_hi` | **New York Fed markets API** | unchanged |
-| `us10y` / `us30y` | Stooq | upgraded to FRED's official series |
-| everything else | CoinGecko · Frankfurter · Stooq | unchanged |
+| `us10y` / `us30y` | Yahoo, then Stooq | upgraded to FRED's official series |
+| everything else | CoinGecko · Frankfurter · Yahoo → Stooq | unchanged |
 
 So the key buys exactly one thing: the two Treasury yields move from a scraped quote to the official series. Worth having, not worth blocking on.
 
@@ -112,9 +114,9 @@ To add it: free key at `fred.stlouisfed.org/docs/api/api_key.html`, then **Setti
 
 Read two things in the log.
 
-**The Self-test step** should print `30/30 checks passed`. It runs entirely offline, before the fetch, so if it fails the problem is the code, not the network - and nothing was written.
+**The Self-test step** should print `35/35 checks passed`. It runs entirely offline, before the fetch, so if it fails the problem is the code, not the network - and nothing was written.
 
-**`sources_failed` in the Fetch output.** `^set` (the Thai SET index) is the one symbol I could not verify against Stooq from here, because outbound HTTP to market APIs is blocked in the sandbox this was written in. If it appears there, try `set.th` or drop the column - nothing else is affected. A couple of other names failing is normal and by design; the run still succeeds.
+**`sources_failed` in the Fetch output.** It should be empty or close to it. A name in there means that column is blank for the week, which is survivable - the run still succeeds. **If every quoted column fails at once while crypto and FX are fine, that is a source blocking the runner by IP, not a symbol problem** - see the troubleshooting table.
 
 Then run it again **without** dry run. `data/series.csv` and `data/brief-block.md` appear, committed by `series-bot`.
 
@@ -134,6 +136,8 @@ Then run it again **without** dry run. `data/series.csv` and `data/brief-block.m
 | Job fails after writing a row | A whole block (crypto or FX) was down | Row is written, run marked red so slow rot is visible. Check next week |
 | Schedule stops after ~2 months | GitHub disables cron on repos with no commits for 60 days | Re-enable in the Actions tab. Weekly commits normally prevent this |
 | `data/` folder never appears | **Dry run was ticked** - it writes nothing, by design | Run again with the box unticked |
+| **Every quoted column `n/a`, crypto and FX fine** | A quote source is blocking the runner by IP. Happened to Stooq on 13 Sept 2026 - all eight symbols failed while every other source succeeded | Fixed: quotes now try **Yahoo first, Stooq second**. If both ever fail together, reorder `QUOTE_SOURCES` or add a third |
+| A column is blank but its source looks up fine by hand | The value failed its **sanity band** and was rejected rather than stored | Check `SANE` in `fetch.py`. Rejection is deliberate - a wrong number is worse than a blank |
 | Yellow "Node.js 20 is deprecated" notice | Action majors still target Node 20 | Cosmetic, the job runs. Fixed in this version: **checkout@v5, setup-python@v6** |
 
 ---
@@ -188,7 +192,7 @@ Slow rot is the real risk with an unattended collector: a source changes its sch
 ```bash
 python fetch.py              # collect, append, regenerate the block
 python fetch.py --dry-run    # fetch and print, write nothing
-python fetch.py --selftest   # 30 checks, offline, no network
+python fetch.py --selftest   # 35 checks, offline, no network
 ```
 
 The self-test covers parsing, the EUR/USD inversion, the stablecoin sum, FRED overwriting Stooq yields when the key is present, **a full collection run with no key at all** (EFFR and the target range survive, yields fall back to Stooq, nothing goes blank, and the absent key is not logged as a failure), partial-failure handling, blank-not-zero, ISO-week stamping, schema alignment across appends, idempotence, delta computation up and down, the target-range render, and the formatting edges. It deliberately fails one source so the partial-failure path is exercised rather than assumed, and the Stooq and FRED yield fixtures carry **different values** so the fallback checks actually discriminate.
