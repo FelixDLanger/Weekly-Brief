@@ -12,17 +12,15 @@
 | USD/THB | 33.065 | - |
 | USD/SGD | 1.2679 | - |
 | EUR/USD | 1.1592 | - |
-| Gold | n/a | - |
-| Brent | n/a | - |
-| US 10y | n/a | - |
-| US 30y | n/a | - |
+| Gold | $4,409 | - |
+| Brent | $104.61 | - |
+| US 10y | 4.97% | - |
+| US 30y | 5.35% | - |
 | Fed funds (EFFR) | 3.63% | - |
 | FOMC target range | 3.50-3.75% | - |
-| SET index | n/a | - |
-| NVDA | n/a | - |
-| GME | n/a | - |
-| SAP ADR | n/a | - |
-
-*Sources unavailable this run: stooq/sap.us;stooq/gme.us;stooq/nvda.us;stooq/^set;stooq/xauusd;stooq/cb.f;stooq/10usy.b;stooq/30usy.b*
+| SET index | 1,604.52 | - |
+| NVDA | $218.29 | - |
+| GME | $21.15 | - |
+| SAP ADR | $206.36 | - |
 
 *1 weeks on record. Deltas are week-over-week against the previous stored row, not a calendar week.*
