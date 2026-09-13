@@ -122,6 +122,10 @@ Then run it again **without** dry run. `data/series.csv` and `data/brief-block.m
 
 > **Expected on the first real run: every delta in the block reads `-`.** There is one row, so there is nothing to compare against. Week two is when the file starts being useful.
 
+> **And expected on any *second* run in the same ISO week: `nothing to commit`.** That is the idempotence guard working, not a failure. The run exits 0. The next real data point is the next scheduled Saturday.
+
+⚠️ **Always start a run with "Run workflow" on the workflow page. Never "Re-run jobs" on a previous run** - a re-run replays the original commit, so it uses the tree *and the workflow file* as they were then. That produces two confusing symptoms at once: stale action versions in the log, and a push rejected because the branch has moved on since.
+
 ---
 
 ## If the first run fails
@@ -131,6 +135,8 @@ Then run it again **without** dry run. `data/series.csv` and `data/brief-block.m
 | No workflow appears in the Actions tab | File is not at `.github/workflows/weekly.yml` | Move it. The path is exact |
 | Cron never fires, manual run works | Workflow is not on the **default branch** | Merge it to the default branch |
 | Everything green until **Commit**, then `403` | Repository workflow permissions are read-only | Settings → Actions → General → **Read and write permissions** |
+| Commit succeeds, then **`! [rejected] main -> main (fetch first)`** | The remote moved after checkout. Usually because **"Re-run jobs" was used instead of "Run workflow"** - a re-run replays the *original commit*, so it checks out a stale tree and an old copy of the workflow file | Fixed: the Commit step now rebases and retries up to three times. **And always start runs with "Run workflow", never "Re-run jobs"** |
+| Warning still names **v4/v5** after you updated the file | Same cause - a re-run uses the workflow file *as it was at that commit* | Start a fresh **Run workflow** |
 | Commit step says `nothing to commit` | This ISO week is already recorded | Correct behaviour. The script is idempotent per week |
 | **Self-test** fails | Code problem, not network | Nothing was written. Send me the log |
 | Job fails after writing a row | A whole block (crypto or FX) was down | Row is written, run marked red so slow rot is visible. Check next week |
