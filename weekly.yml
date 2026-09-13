@@ -1,0 +1,66 @@
+name: Weekly series for the brief
+
+on:
+  schedule:
+    # 01:30 UTC Saturday = 08:30 Bangkok, before the brief is written.
+    # GitHub's scheduler is best effort and can run late under load - fine,
+    # the script is idempotent per ISO week.
+    - cron: "30 1 * * 6"
+  workflow_dispatch:          # run by hand from the Actions tab
+    inputs:
+      dry_run:
+        description: "Fetch and print without writing or committing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # needed to commit the CSV and the brief block
+
+concurrency:                  # a manual run during the scheduled one cannot
+  group: weekly-series        # produce two commits racing on the same file
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Runs offline against fixtures. If the parsing, schema, idempotence
+      # or delta logic is broken, the job stops HERE - before it can append
+      # a malformed row to a file that is the record.
+      - name: Self-test
+        run: python fetch.py --selftest
+
+      - name: Fetch
+        env:
+          # The ONLY secret, and it is optional. Unset, the run still
+          # collects every column - the two Treasury yields just come from
+          # Stooq instead of the official FRED series. An unset secret
+          # resolves to an empty string here, which the script treats as
+          # absent; it is not an error and is not logged as a failure.
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python fetch.py --dry-run
+          else
+            python fetch.py
+          fi
+
+      - name: Commit
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          git config user.name  "series-bot"
+          git config user.email "series-bot@users.noreply.github.com"
+          git add data/series.csv data/brief-block.md
+          # No change means this week was already recorded - exit cleanly.
+          git diff --staged --quiet && echo "nothing to commit" && exit 0
+          git commit -m "data: week $(date -u +%G-W%V)"
+          git push
