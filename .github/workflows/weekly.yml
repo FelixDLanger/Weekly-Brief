@@ -12,6 +12,14 @@ on:
         description: "Fetch and print without writing or committing"
         type: boolean
         default: false
+      repair:
+        description: "Fill only the BLANK fields in this week's row (use after fixing a source)"
+        type: boolean
+        default: false
+      force:
+        description: "Replace this week's row entirely - a fresh snapshot. Prefer repair"
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # needed to commit the CSV and the brief block
@@ -54,6 +62,10 @@ jobs:
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             python fetch.py --dry-run
+          elif [ "${{ inputs.repair }}" = "true" ]; then
+            python fetch.py --repair
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            python fetch.py --force
           else
             python fetch.py
           fi
