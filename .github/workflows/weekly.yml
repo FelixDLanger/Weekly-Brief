@@ -2,10 +2,16 @@ name: Weekly series for the brief
 
 on:
   schedule:
-    # 01:30 UTC Saturday = 08:30 Bangkok, before the brief is written.
-    # GitHub's scheduler is best effort and can run late under load - fine,
-    # the script is idempotent per ISO week.
-    - cron: "30 1 * * 6"
+    # Saturday 05:17 Bangkok (UTC+7, no daylight saving) = Friday 22:17 UTC.
+    # Off the hour on purpose: GitHub's scheduler is best effort and delays
+    # most at :00 and :30 - the old 01:30 UTC slot landed 4.5-6 hours late
+    # (13:00-14:40 Bangkok) in October 2026. Friday 22:17 UTC is after the
+    # US equity and CME futures closes in both summer and winter time.
+    - cron: "17 22 * * 5"
+    # Backup, Saturday 09:17 Bangkok = Saturday 02:17 UTC. The script is
+    # idempotent per ISO week: a no-op when the first run recorded the week,
+    # a normal run if GitHub dropped the first one.
+    - cron: "17 2 * * 6"
   workflow_dispatch:          # run by hand from the Actions tab
     inputs:
       dry_run:
@@ -85,7 +91,8 @@ jobs:
             echo "nothing to commit"
             exit 0
           fi
-          git commit -m "data: week $(date -u +%G-W%V)"
+          # Labeled by the Bangkok week, the calendar fetch.py files the row under.
+          git commit -m "data: week $(TZ=Asia/Bangkok date +%G-W%V)"
 
           # The remote can move between checkout and push: a web-UI edit, an
           # overlapping run, or a "Re-run jobs" replaying an older commit.

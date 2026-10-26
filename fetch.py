@@ -26,6 +26,17 @@ Design rules:
   - Idempotent per ISO week. Re-running on the same Saturday is a no-op.
   - PUBLIC DATA ONLY. Never add positions, holdings, order sizes or account
     values to this file. If the repo is public, this rule is the whole fence.
+
+v2.1 (October 2026):
+  - DATED Brent (EIA's physical North Sea price, via FRED) next to the Brent
+    future, with its own observation date. Keyless by default; the FRED API
+    is used only when FRED_API_KEY is set.
+  - The CONTRACT behind each continuous future (BZ=F, GC=F) is stored as a
+    label such as "Z26", so a roll prints as "roll Z26->F27" instead of a
+    fake week-on-week change between two different contracts.
+  - The CSV schema MIGRATES itself: new columns are appended at the end and
+    earlier weeks are padded with blanks. Any other header change is refused.
+  - sources_ok keeps one unit - successful source calls - on repair runs too.
 """
 
 import argparse
@@ -33,8 +44,9 @@ import csv
 import io
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -43,7 +55,17 @@ ROOT = Path(__file__).parent
 CSV_PATH = ROOT / "data" / "series.csv"
 BLOCK_PATH = ROOT / "data" / "brief-block.md"
 TIMEOUT = 25
-UA = {"User-Agent": "brief-dataengine/2.0 (+github actions)"}
+UA = {"User-Agent": "brief-dataengine/2.1 (+github actions)"}
+
+# The brief runs on Bangkok time (UTC+7, no daylight saving). Rows are dated
+# and keyed by the BANGKOK calendar, so the Friday-night UTC run is filed under
+# the Saturday it serves - the same date convention as every row before it.
+BKK = timezone(timedelta(hours=7), "Asia/Bangkok")
+
+
+def run_clock():
+    """Now, on the brief's clock."""
+    return datetime.now(timezone.utc).astimezone(BKK)
 
 # Column order is FIXED. To add a series, append to the END of this list.
 # Never insert in the middle - historic rows misalign and the CSV is the record.
@@ -62,10 +84,35 @@ FIELDS = [
     "ffr", "fed_target_lo", "fed_target_hi",
     # meta
     "sources_ok", "sources_failed",
+    # v2.1 - appended at the END, per the rule above
+    "brent_dated_usd", "brent_dated_date", "brent_contract", "gold_contract",
 ]
+
+# Metadata travels WITH a value but is not a value: it is never counted as a
+# data field and never repaired on its own.
+META_FIELDS = ("date", "iso_week", "sources_ok", "sources_failed",
+               "brent_dated_date", "brent_contract", "gold_contract")
+
+# A companion is written together with its value, and only with it - so a
+# repaired value can never sit next to a label from a different reading.
+COMPANIONS = {
+    "brent_dated_usd": ("brent_dated_date",),
+    "brent_usd": ("brent_contract",),
+    "gold_usd": ("gold_contract",),
+}
 
 successes: list[str] = []
 failures: list[str] = []
+provenance: dict[str, str] = {}      # field -> the source that supplied it
+_yahoo_meta: dict[str, dict] = {}    # symbol -> chart meta, this run only
+
+
+def reset_run_state():
+    """One collection, one clean slate. collect() can run twice in a process
+    (repair, the self-test), and a success from an earlier pass must never be
+    counted again or lend its provenance to a later value."""
+    global successes, failures, provenance, _yahoo_meta
+    successes, failures, provenance, _yahoo_meta = [], [], {}, {}
 
 
 def ok(name):
@@ -151,6 +198,7 @@ def yahoo_last_close(symbol, http=requests):
                  headers=UA, timeout=TIMEOUT)
     r.raise_for_status()
     res = r.json()["chart"]["result"][0]
+    _yahoo_meta[symbol] = res.get("meta") or {}
     price = res["meta"].get("regularMarketPrice")
     if price in (None, ""):
         raise ValueError("no regularMarketPrice in meta")
@@ -206,6 +254,7 @@ SANE = {
     "brent_usd": (5, 500),
     "us10y":     (0.1, 20),
     "us30y":     (0.1, 20),
+    "brent_dated_usd": (5, 500),
 }
 
 FETCHERS = {"yahoo": yahoo_last_close, "stooq": stooq_last_close}
@@ -226,6 +275,7 @@ def fetch_quotes(row, http=requests):
                     raise ValueError(
                         f"{v} outside sane band {lo}-{hi} for {field}")
                 row[field] = v
+                provenance[field] = f"{name}/{sym}"
                 ok(f"{name}/{sym}")
                 break
             except Exception as e:
@@ -287,9 +337,242 @@ def fetch_fred(row, http=requests):
             fail(f"fred/{series}", e)
 
 
+DATED_BRENT_SERIES = "DCOILBRENTEU"   # EIA, Europe Brent Spot Price FOB
+DATED_MAX_AGE_DAYS = 16               # FRED posts EIA's spot prices weekly, with a lag
+
+
+def _parse_fred_graph_csv(text):
+    """FRED's keyless graph CSV. The header is 'observation_date,<ID>' (since
+    2024) or 'DATE,<ID>' (older) - both are accepted. Missing days are '.' or
+    empty and are skipped. Returns the latest (date, value)."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        raise ValueError("empty response")
+    header = [h.strip().lower() for h in rows[0]]
+    if len(header) < 2 or header[0] not in ("observation_date", "date"):
+        raise ValueError(f"unexpected header: {rows[0]}")
+    latest = None
+    for r in rows[1:]:
+        if len(r) < 2:
+            continue
+        day, value = r[0].strip(), r[1].strip()
+        if value in ("", "."):
+            continue
+        latest = (day, float(value))
+    if latest is None:
+        raise ValueError("no observations")
+    return latest
+
+
+def fetch_dated_brent(row, http=requests, when=None):
+    """Dated Brent: the price of a physical North Sea cargo, EIA via FRED.
+
+    brent_usd (the future) answers "what is a barrel for later delivery";
+    this answers "what does a cargo cost now". In a supply shock the two can
+    sit $20 apart for weeks, so the brief needs both - and the brief's own
+    forecasts resolve on the EIA series, not on the future.
+
+    Keyless by default (FRED's public graph CSV); the API is used only when
+    FRED_API_KEY is set. The observation date is stored with the value, and a
+    reading older than DATED_MAX_AGE_DAYS is REJECTED: a stale print stored
+    under this week's date would look like a fresh one."""
+    when = when or run_clock()
+    src = f"fred/{DATED_BRENT_SERIES}"
+    key = os.environ.get("FRED_API_KEY")
+    try:
+        if key:
+            r = http.get("https://api.stlouisfed.org/fred/series/observations",
+                         params={"series_id": DATED_BRENT_SERIES, "api_key": key,
+                                 "file_type": "json", "sort_order": "desc",
+                                 "limit": 10},
+                         headers=UA, timeout=TIMEOUT)
+            r.raise_for_status()
+            obs = next((o for o in r.json()["observations"]
+                        if o.get("value") not in (".", "", None)), None)
+            if obs is None:
+                raise ValueError("no observations")
+            day, value = obs["date"], float(obs["value"])
+        else:
+            start = (when - timedelta(days=45)).strftime("%Y-%m-%d")
+            r = http.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                         params={"id": DATED_BRENT_SERIES, "cosd": start},
+                         headers=UA, timeout=TIMEOUT)
+            r.raise_for_status()
+            day, value = _parse_fred_graph_csv(r.text)
+        age = (when.date() - datetime.strptime(day, "%Y-%m-%d").date()).days
+        if age > DATED_MAX_AGE_DAYS:
+            raise ValueError(f"latest observation {day} is {age} days old")
+        if age < -1:
+            raise ValueError(f"observation {day} is dated after the run")
+        lo, hi = SANE["brent_dated_usd"]
+        if not (lo <= value <= hi):
+            raise ValueError(f"{value} outside sane band {lo}-{hi}")
+        row["brent_dated_usd"] = value
+        row["brent_dated_date"] = day
+        provenance["brent_dated_usd"] = src
+        ok(src)
+    except Exception as e:
+        fail(src, e)
+
+
+MONTH_CODES = "FGHJKMNQUVXZ"
+MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def contract_code(year, month):
+    """CME-style contract code: month letter plus two-digit year, e.g. Z26."""
+    return f"{MONTH_CODES[month - 1]}{year % 100:02d}"
+
+
+def _add_months(year, month, k):
+    m = month - 1 + k
+    return year + m // 12, m % 12 + 1
+
+
+def brent_candidates(when):
+    """Brent lists a contract for every month, and the front month sits two
+    or three months ahead (December expires on the last business day of
+    October). Four candidates cover every point in the cycle."""
+    return [contract_code(*_add_months(when.year, when.month, k))
+            for k in (1, 2, 3, 4)]
+
+
+GOLD_ACTIVE_MONTHS = (2, 4, 6, 8, 10, 12)
+
+
+def gold_candidates(when):
+    """COMEX gold's active months are Feb, Apr, Jun, Aug, Oct and Dec, and
+    the continuous series rolls before a delivery month starts - so the front
+    is always an active month strictly after the current one."""
+    out, y, m = [], when.year, when.month
+    while len(out) < 3:
+        y, m = _add_months(y, m, 1)
+        if m in GOLD_ACTIVE_MONTHS:
+            out.append(contract_code(y, m))
+    return out
+
+
+# field: (continuous symbol, Yahoo contract suffix, root, candidates, label column)
+CONTRACT_SPECS = {
+    "brent_usd": ("BZ=F", ".NYM", "BZ", brent_candidates, "brent_contract"),
+    "gold_usd": ("GC=F", ".CMX", "GC", gold_candidates, "gold_contract"),
+}
+CONTRACT_MATCH_TOL = 0.005    # a contract matches if within 0.5% of the continuous price
+
+_SHORTNAME_MONTH = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+'?(\d{2}|\d{4})\b")
+
+
+def _label_from_shortname(name):
+    m = _SHORTNAME_MONTH.search(name or "")
+    if not m:
+        return None
+    return contract_code(int(m.group(2)) % 100, MONTH_ABBR.index(m.group(1)) + 1)
+
+
+def fetch_contracts(row, http=requests, when=None):
+    """Which contract is behind each continuous future? METADATA ONLY: the
+    label never changes a value, and failing to find it is not a source
+    failure.
+
+    It exists because a continuous futures series rolls from one contract to
+    the next before expiry, and a week-on-week change across a roll compares
+    two different contracts - on 23 Oct 2026 that turned a +6.2% week for
+    December Brent into a printed +1.7%. With the label stored, the block
+    prints the roll instead of a fake change.
+
+    Method: price-match the continuous quote against the individual contracts
+    that could be the front month; fall back to the month in Yahoo's short
+    name only if no contract could be fetched at all."""
+    when = when or run_clock()
+    for field, (cont, suffix, root, candidates, label_col) in CONTRACT_SPECS.items():
+        if provenance.get(field) != f"yahoo/{cont}":
+            continue   # blank, or from a fallback with no contract (e.g. spot gold)
+        price = num(row.get(field))
+        if not price:
+            continue
+        best, fetched_any = None, False
+        for code in candidates(when):
+            try:
+                p = yahoo_last_close(f"{root}{code}{suffix}", http)
+            except Exception:
+                continue
+            fetched_any = True
+            gap = abs(p / price - 1)
+            if gap <= CONTRACT_MATCH_TOL and (best is None or gap < best[0]):
+                best = (gap, code)
+                if gap < 1e-9:
+                    break
+        label = best[1] if best else None
+        if label is None and not fetched_any:
+            label = _label_from_shortname((_yahoo_meta.get(cont) or {}).get("shortName"))
+        if label:
+            row[label_col] = label
+        else:
+            print(f"  - {field}: contract behind {cont} not identified "
+                  f"(label left blank, value unaffected)")
+
+
 # ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
+class SchemaError(RuntimeError):
+    """The CSV's header is not one this version can safely extend."""
+
+
+def migrate_schema(path=None, write=True):
+    """Bring an existing CSV up to the current FIELDS before anything reads
+    or writes it. Returns "none" (no file yet), "current", "migrated", or -
+    with write=False - "would-migrate".
+
+    The only schema change ever allowed is appending columns at the END (the
+    rule above FIELDS). So a header that is a strict prefix of FIELDS is
+    padded: the new columns are added and every earlier row gets blanks in
+    them, its existing cells untouched. Anything else - a reordered, renamed
+    or longer header, or a ragged row - is REFUSED with SchemaError. The CSV
+    is the record, and a silent re-map would corrupt it. The rewrite goes
+    through a temporary file and an atomic rename, so a crash mid-way leaves
+    the original intact."""
+    path = path or CSV_PATH
+    if not path.exists() or path.stat().st_size == 0:
+        return "none"
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        body = list(reader)
+    if header is None:
+        return "none"
+    if header == FIELDS:
+        return "current"
+    if len(header) >= len(FIELDS) or header != FIELDS[:len(header)]:
+        raise SchemaError(
+            f"{path.name}: header is not a prefix of the current FIELDS, so "
+            f"it cannot be extended safely. Restore the original header. "
+            f"Found {len(header)} columns: {header}")
+    for i, r in enumerate(body, start=2):
+        if len(r) != len(header):
+            raise SchemaError(
+                f"{path.name}: line {i} has {len(r)} cells against "
+                f"{len(header)} header columns - refusing to migrate a ragged file")
+    if not write:
+        return "would-migrate"
+    pad = [""] * (len(FIELDS) - len(header))
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(FIELDS)
+        for r in body:
+            w.writerow(r + pad)
+    os.replace(tmp, path)
+    return "migrated"
+
+
+def schema_state(path=None):
+    """Read-only version of migrate_schema, for dry runs."""
+    return migrate_schema(path, write=False)
+
+
 def read_rows():
     if not CSV_PATH.exists():
         return []
@@ -322,8 +605,21 @@ def replace_week(row):
         w.writerows(out)
 
 
-DATA_FIELDS = [f for f in FIELDS
-               if f not in ("date", "iso_week", "sources_ok", "sources_failed")]
+DATA_FIELDS = [f for f in FIELDS if f not in META_FIELDS]
+
+# Which source call supplies each data field. A repair adds one to
+# sources_ok per family that newly supplied a value, which keeps the column's
+# unit (successful source calls) the same as on a normal run. Quoted fields
+# are one call each.
+SOURCE_FAMILY = {
+    **{f: "coingecko/prices" for f in (
+        "btc_usd", "btc_mcap", "eth_usd", "sol_usd", "sol_mcap",
+        "usdt_mcap", "usdc_mcap", "stablecoin_proxy_mcap")},
+    **{f: "coingecko/global" for f in ("total_crypto_mcap", "btc_dominance")},
+    **{f: "frankfurter/fx" for f in ("usdthb", "usdsgd", "eurusd")},
+    **{f: "nyfed/effr" for f in ("ffr", "fed_target_lo", "fed_target_hi")},
+    "brent_dated_usd": "fred/DCOILBRENTEU",
+}
 
 
 def blanks_in(existing):
@@ -351,10 +647,16 @@ def repair_week(iso_week, rows, http=requests, when=None):
     merged = dict(existing)
     for f in filled:
         merged[f] = fresh[f]
+        for c in COMPANIONS.get(f, ()):
+            merged[c] = fresh.get(c, "")
     still_blank = [f for f in missing if f not in filled]
     merged["sources_failed"] = ";".join(still_blank)
-    merged["sources_ok"] = len([f for f in DATA_FIELDS
-                                if merged.get(f) not in (None, "")])
+    # v2.0 recounted non-blank data FIELDS here (about 26) while a normal run
+    # counts successful SOURCE CALLS (12 on a clean week), so the column
+    # changed its unit on every repaired week. Keep the unit instead.
+    base = int(num(existing.get("sources_ok")) or 0)
+    merged["sources_ok"] = base + len(
+        {SOURCE_FAMILY.get(f, f"quote/{f}") for f in filled})
     return merged, filled, still_blank
 
 
@@ -377,6 +679,18 @@ def num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def last_business_day(date_str):
+    """The trading day before a run date: Saturday's run reads Friday's close."""
+    try:
+        d = datetime.strptime(date_str or "", "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
 
 
 def pct(now, prev):
@@ -419,6 +733,56 @@ def render_block(rows):
         d = pct(cur.get(field), prev.get(field)) if show_delta else ""
         return f"| {label} | {v} | {d or '-'} |"
 
+    rolls = []
+
+    def future_line(label, symbol, field, cfield, dp):
+        """A continuous future, named with the contract behind it. Across a
+        roll the week-on-week change compares two different contracts, so it
+        is replaced by the roll itself."""
+        c, pc = cur.get(cfield) or "", prev.get(cfield) or ""
+        name = f"{label} ({symbol}, {c})" if c else f"{label} ({symbol})"
+        v = fmt(cur.get(field), dp, "$")
+        if num(cur.get(field)) is None:
+            return f"| {name} | {v} | - |"
+        if c and pc and c != pc:
+            rolls.append(f"{symbol} {pc}→{c}")
+            return f"| {name} | {v} | roll {pc}→{c} |"
+        d = pct(cur.get(field), prev.get(field))
+        if d and c and not pc:
+            d += " (prev unlabeled)"
+        elif d and pc and not c:
+            d += " (contract unknown)"
+        return f"| {name} | {v} | {d or '-'} |"
+
+    def dated_line():
+        """Dated Brent carries its own observation date. FRED posts EIA's
+        prices weekly with a lag, so two runs can store the same print - that
+        is said plainly instead of showing as 'flat'."""
+        d = cur.get("brent_dated_date") or ""
+        pd = prev.get("brent_dated_date") or ""
+        name = f"Brent dated (EIA, obs {d})" if d else "Brent dated (EIA)"
+        v = fmt(cur.get("brent_dated_usd"), 2, "$")
+        if num(cur.get("brent_dated_usd")) is None:
+            return f"| {name} | {v} | - |"
+        if d and d == pd:
+            return f"| {name} | {v} | same print |"
+        delta = pct(cur.get("brent_dated_usd"), prev.get("brent_dated_usd"))
+        return f"| {name} | {v} | {delta or '-'} |"
+
+    def spread_line():
+        """Physical minus futures: the premium for a barrel now over a barrel
+        later. The two prints usually come from different days - say so."""
+        dated, fut = num(cur.get("brent_dated_usd")), num(cur.get("brent_usd"))
+        if dated is None or fut is None:
+            return None
+        label = "Dated minus BZ=F"
+        obs = cur.get("brent_dated_date") or ""
+        fday = last_business_day(cur.get("date"))
+        if obs and fday and obs != fday:
+            label += " (days differ)"
+        gap = dated - fut
+        return f"| {label} | {'+' if gap >= 0 else '-'}${abs(gap):,.2f} | - |"
+
     stable_bn = num(cur.get("stablecoin_proxy_mcap"))
     stable_txt = f"${stable_bn/1e9:,.1f}bn" if stable_bn else "n/a"
     stable_d = pct(cur.get("stablecoin_proxy_mcap"),
@@ -442,8 +806,10 @@ def render_block(rows):
         line("USD/THB", "usdthb", 3),
         line("USD/SGD", "usdsgd", 4),
         line("EUR/USD", "eurusd", 4),
-        line("Gold", "gold_usd", 0, "$"),
-        line("Brent", "brent_usd", 2, "$"),
+        future_line("Gold", "GC=F", "gold_usd", "gold_contract", 0),
+        future_line("Brent futures", "BZ=F", "brent_usd", "brent_contract", 2),
+        dated_line(),
+        spread_line(),
         line("US 10y", "us10y", 2, "", "%"),
         line("US 30y", "us30y", 2, "", "%"),
         line("Fed funds (EFFR)", "ffr", 2, "", "%"),
@@ -454,6 +820,12 @@ def render_block(rows):
         line("SAP ADR", "sap_adr", 2, "$"),
         "",
     ]
+    out = [x for x in out if x is not None]
+    if rolls:
+        out.append(f"*Contract roll this week: {', '.join(rolls)}. The w/w "
+                   f"change would compare two different contracts, so it is "
+                   f"not printed.*")
+        out.append("")
     if cur.get("sources_failed"):
         out.append(f"*Sources unavailable this run: {cur['sources_failed']}*")
         out.append("")
@@ -478,7 +850,26 @@ class _Resp:
 
 class _FakeHTTP:
     """Replays fixtures. Deliberately fails one Stooq symbol so the
-    partial-failure path is exercised rather than assumed."""
+    partial-failure path is exercised rather than assumed.
+
+    v2.1: futures_up serves BZ=F and GC=F (by default both fail, to keep the
+    fallback path tested), plus the individual contracts behind them;
+    contracts_down makes every single-contract lookup fail; dated sets the
+    latest dated-Brent observation (date, value)."""
+
+    def __init__(self, futures_up=False, contracts_down=False,
+                 brent_cont=116.72, dated=("2026-09-08", "97.40")):
+        self.futures_up, self.contracts_down = futures_up, contracts_down
+        self.brent_cont, self.dated = brent_cont, dated
+        self.contracts = {
+            "BZX26.NYM": 120.10, "BZZ26.NYM": 116.72, "BZF27.NYM": 111.70,
+            "BZG27.NYM": 108.00, "BZH27.NYM": 105.40,
+            "GCZ26.CMX": 4007.9, "GCG27.CMX": 4040.5, "GCJ27.CMX": 4070.2,
+        }
+
+    def _day_after(self, day):
+        d = datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)
+        return d.strftime("%Y-%m-%d")
 
     def get(self, url, params=None, headers=None, timeout=None):
         params = params or {}
@@ -498,17 +889,28 @@ class _FakeHTTP:
                                     "EUR": 0.9174}})
         if "query1.finance.yahoo.com" in url:
             sym = url.rsplit("/", 1)[-1]
-            # GC=F and BZ=F fail so the FALLBACK path is exercised, not assumed.
-            if sym in ("GC=F", "BZ=F"):
+            # By default GC=F and BZ=F fail so the FALLBACK path is exercised,
+            # not assumed.
+            if sym in ("GC=F", "BZ=F") and not self.futures_up:
                 raise RuntimeError("simulated primary outage")
+            if sym.endswith((".NYM", ".CMX")):
+                if self.contracts_down or sym not in self.contracts:
+                    raise RuntimeError("no such contract")
+                return _Resp({"chart": {"result": [{"meta": {
+                    "regularMarketPrice": self.contracts[sym]}}]}})
             prices = {
                 "SAP": 216.00, "GME": 21.50, "NVDA": 180.00,
                 "^SET.BK": 1200.00,
                 "^TNX": 43.12,   # the x10 convention - must normalise to 4.312
                 "^TYX": 999.0,   # absurd - must be REJECTED by the sane band
+                "BZ=F": self.brent_cont, "GC=F": 4007.9,
             }
-            return _Resp({"chart": {"result": [
-                {"meta": {"regularMarketPrice": prices[sym]}}]}})
+            meta = {"regularMarketPrice": prices[sym]}
+            short = {"BZ=F": "Brent Crude Oil Last Day Financ",
+                     "GC=F": "Gold Dec 26"}
+            if sym in short:
+                meta["shortName"] = short[sym]
+            return _Resp({"chart": {"result": [{"meta": meta}]}})
         if "stooq.com" in url:
             sym = params.get("s")
             if sym == "cb.f":       # both sources down for brent -> blank
@@ -527,8 +929,19 @@ class _FakeHTTP:
                 "percentRate": 3.63,
                 "targetRateFrom": 3.5, "targetRateTo": 3.75,
             }]})
+        if "fredgraph.csv" in url:
+            day, value = self.dated
+            return _Resp(text="observation_date,DCOILBRENTEU\n"
+                              "2026-08-31,95.10\n"
+                              f"{day},{value}\n"
+                              f"{self._day_after(day)},.\n")
         if "stlouisfed" in url:
             series = params.get("series_id")
+            if series == "DCOILBRENTEU":
+                day, value = self.dated
+                return _Resp({"observations": [
+                    {"date": self._day_after(day), "value": "."},
+                    {"date": day, "value": value}]})
             vals = {"DGS10": "4.31", "DGS30": "4.88"}
             return _Resp({"observations": [{"value": "."},
                                            {"value": vals[series]}]})
@@ -616,7 +1029,8 @@ def selftest():
     BLOCK_PATH.write_text(block, encoding="utf-8")
     check("delta computed up", "+4.8%" in block)
     check("delta computed down", "-6.9%" in block)
-    check("missing series shows n/a, not 0", "| Brent | n/a |" in block)
+    check("missing series shows n/a, not 0",
+          "| Brent futures (BZ=F) | n/a |" in block)
     check("failure surfaced in block", "Sources unavailable" in block)
     check("week count stated", "2 weeks on record" in block)
     check("target range rendered", "| FOMC target range | 3.50-3.75% |" in block)
@@ -669,6 +1083,190 @@ def selftest():
     check("pct handles zero base", pct("5", "0") == "")
     check("fmt handles None", fmt(None) == "n/a")
 
+    # ------------------------------------------------------------------ v2.1
+    def raises(fn, exc=Exception):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def write_rows(rows_):
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows_)
+
+    print("Self-test: v2.1 contract labels and dated Brent")
+    check("spot fallback carries no contract label", r1["gold_contract"] == "")
+    check("dated brent stored on the legacy weeks too",
+          r1["brent_dated_usd"] == 97.40 and r1["brent_dated_date"] == "2026-09-08")
+    tmp2 = Path(tempfile.mkdtemp())
+    CSV_PATH = tmp2 / "data" / "series.csv"
+    BLOCK_PATH = tmp2 / "data" / "brief-block.md"
+    os.environ["FRED_API_KEY"] = "selftest"
+    hf = _FakeHTTP(futures_up=True, dated=("2026-10-20", "115.22"))
+    ra = collect(hf, when=datetime(2026, 10, 24, tzinfo=timezone.utc))
+    check("brent future from the primary source", ra["brent_usd"] == 116.72)
+    check("brent contract identified by price match", ra["brent_contract"] == "Z26")
+    check("gold contract identified by price match", ra["gold_contract"] == "Z26")
+    check("dated brent collected via the API", ra["brent_dated_usd"] == 115.22)
+    check("dated brent carries its observation date",
+          ra["brent_dated_date"] == "2026-10-20")
+    check("contract lookups are not counted as sources",
+          not any(".NYM" in s or ".CMX" in s for s in successes))
+    check("sources_ok counts source calls, dated series included",
+          ra["sources_ok"] == 15)
+    check("brent candidates span the cycle",
+          brent_candidates(datetime(2026, 10, 24)) == ["X26", "Z26", "F27", "G27"])
+    check("gold candidates are active months after this one",
+          gold_candidates(datetime(2026, 12, 3)) == ["G27", "J27", "M27"])
+    append(ra)
+    hf.brent_cont = 111.70        # the continuous series has rolled to January
+    rb = collect(hf, when=datetime(2026, 10, 31, tzinfo=timezone.utc))
+    check("roll detected: the new contract label", rb["brent_contract"] == "F27")
+    append(rb)
+    blk = render_block(read_rows())
+    check("roll printed instead of a cross-contract delta",
+          "| Brent futures (BZ=F, F27) | $111.70 | roll Z26→F27 |" in blk)
+    check("roll explained under the table",
+          "Contract roll this week: BZ=F Z26→F27." in blk)
+    check("an unchanged contract keeps its delta",
+          "| Gold (GC=F, Z26) | $4,008 | flat |" in blk)
+    check("an unchanged dated print says so",
+          "| Brent dated (EIA, obs 2026-10-20) | $115.22 | same print |" in blk)
+    check("spread printed, different days flagged",
+          "| Dated minus BZ=F (days differ) | +$3.52 | - |" in blk)
+    check("last business day before a Saturday run is Friday",
+          last_business_day("2026-10-31") == "2026-10-30")
+
+    print("Self-test: v2.1 keyless dated Brent, staleness, fallbacks")
+    del os.environ["FRED_API_KEY"]
+    rk2 = collect(hf, when=datetime(2026, 10, 24, tzinfo=timezone.utc))
+    check("dated brent keyless via the graph CSV",
+          rk2["brent_dated_usd"] == 115.22 and rk2["brent_dated_date"] == "2026-10-20")
+    check("keyless dated brent is not logged as a failure",
+          not any("fred" in f for f in failures))
+    check("legacy DATE header parsed, missing day skipped",
+          _parse_fred_graph_csv("DATE,DCOILBRENTEU\n2026-10-19,118.82\n"
+                                "2026-10-20,.\n") == ("2026-10-19", 118.82))
+    check("unexpected graph header refused",
+          raises(lambda: _parse_fred_graph_csv("foo,bar\n1,2\n")))
+    rs = collect(hf, when=datetime(2026, 11, 20, tzinfo=timezone.utc))
+    check("stale dated print rejected and named",
+          rs["brent_dated_usd"] == "" and "fred/DCOILBRENTEU" in rs["sources_failed"])
+    check("a rejected print leaves no orphan date", rs["brent_dated_date"] == "")
+    hd = _FakeHTTP(futures_up=True, contracts_down=True,
+                   dated=("2026-10-20", "115.22"))
+    rf = collect(hd, when=datetime(2026, 10, 24, tzinfo=timezone.utc))
+    check("gold label falls back to Yahoo's short name", rf["gold_contract"] == "Z26")
+    check("brent label left blank when nothing identifies it",
+          rf["brent_contract"] == "" and rf["brent_usd"] == 116.72)
+    check("an unidentified contract is not a source failure",
+          rf["sources_failed"] == "")
+    check("short-name parser reads 'Dec 26'", _label_from_shortname("Gold Dec 26") == "Z26")
+    check("short-name parser ignores names without a month",
+          _label_from_shortname("Brent Crude Oil Last Day Financ") is None)
+    ra2 = collect(hf, when=datetime(2026, 10, 24, tzinfo=timezone.utc))
+    ra3 = collect(hf, when=datetime(2026, 10, 24, tzinfo=timezone.utc))
+    check("a second collection does not double-count sources",
+          ra2["sources_ok"] == ra3["sources_ok"] == 13)
+
+    print("Self-test: v2.1 schema migration")
+    old_fields = FIELDS[:-4]
+    mig = tmp2 / "old.csv"
+    rows_old = [[f"v{i}_{j}" for j in range(len(old_fields))] for i in range(2)]
+    with mig.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(old_fields)
+        w.writerows(rows_old)
+    before_bytes = mig.read_bytes()
+    check("old schema detected, dry check writes nothing",
+          schema_state(mig) == "would-migrate" and mig.read_bytes() == before_bytes)
+    check("migration reports migrated", migrate_schema(mig) == "migrated")
+    with mig.open(newline="", encoding="utf-8") as f:
+        mrows = list(csv.reader(f))
+    check("header is now the current FIELDS", mrows[0] == FIELDS)
+    check("every row padded to the full width",
+          all(len(r) == len(FIELDS) for r in mrows[1:]))
+    check("old cells unchanged", [r[:len(old_fields)] for r in mrows[1:]] == rows_old)
+    check("new columns blank for earlier weeks",
+          all(r[len(old_fields):] == [""] * 4 for r in mrows[1:]))
+    after_first = mig.read_bytes()
+    check("migration is idempotent",
+          migrate_schema(mig) == "current" and mig.read_bytes() == after_first)
+    check("no temporary file left behind", not (tmp2 / "old.csv.tmp").exists())
+    bad = tmp2 / "bad.csv"
+    swapped = list(old_fields)
+    swapped[2], swapped[3] = swapped[3], swapped[2]
+    bad.write_text(",".join(swapped) + "\r\n", encoding="utf-8")
+    bad_before = bad.read_bytes()
+    check("reordered header refused, file untouched",
+          raises(lambda: migrate_schema(bad), SchemaError) and bad.read_bytes() == bad_before)
+    longer = tmp2 / "longer.csv"
+    longer.write_text(",".join(FIELDS + ["mystery"]) + "\r\n", encoding="utf-8")
+    check("header longer than FIELDS refused",
+          raises(lambda: migrate_schema(longer), SchemaError))
+    ragged = tmp2 / "ragged.csv"
+    ragged.write_text(",".join(old_fields) + "\r\n" + "a,b\r\n", encoding="utf-8")
+    check("ragged file refused", raises(lambda: migrate_schema(ragged), SchemaError))
+    check("missing file is not an error", migrate_schema(tmp2 / "none.csv") == "none")
+    keep = CSV_PATH
+    CSV_PATH = mig
+    append(collect(hf, when=datetime(2026, 10, 24, tzinfo=timezone.utc)))
+    with mig.open(newline="", encoding="utf-8") as f:
+        check("a new row aligns after migration",
+              all(len(r) == len(FIELDS) for r in csv.reader(f)))
+    CSV_PATH = keep
+
+    print("Self-test: v2.1 repair keeps units and companions")
+    os.environ["FRED_API_KEY"] = "selftest"
+    rows_r = read_rows()
+    rows_r[-1].update({"gold_usd": "", "gold_contract": "",
+                       "brent_contract": "", "sources_ok": "12"})
+    write_rows(rows_r)
+    wk = rows_r[-1]["iso_week"]
+    m3, filled3, _ = repair_week(wk, read_rows(), hf,
+                                 when=datetime(2026, 10, 31, tzinfo=timezone.utc))
+    check("repair fills a value and its label together",
+          m3["gold_usd"] == 4007.9 and m3["gold_contract"] == "Z26")
+    check("repair never labels a value it did not fetch", m3["brent_contract"] == "")
+    check("repair adds one per source call", m3["sources_ok"] == 13)
+    replace_week(m3)
+    rows_r2 = read_rows()
+    rows_r2[-1].update({"btc_usd": "", "eth_usd": "", "sources_ok": "12"})
+    write_rows(rows_r2)
+    m4, filled4, _ = repair_week(wk, read_rows(), hf,
+                                 when=datetime(2026, 10, 31, tzinfo=timezone.utc))
+    check("two fields from one call count once",
+          sorted(filled4) == ["btc_usd", "eth_usd"] and m4["sources_ok"] == 13)
+
+    print("Self-test: v2.1 renders older rows")
+    labeled = dict(read_rows()[-1])
+    labeled["brent_contract"] = "F27"
+    unlabeled = dict(labeled)
+    for k in ("brent_contract", "gold_contract", "brent_dated_usd", "brent_dated_date"):
+        unlabeled[k] = ""
+    unlabeled["brent_usd"] = "116.72"
+    check("first labeled week flags the unlabeled base",
+          "(prev unlabeled)" in render_block([unlabeled, labeled]))
+    check("an unlabeled week after a labeled one says so",
+          "(contract unknown)" in render_block([labeled, unlabeled]))
+
+    print("Self-test: v2.1 Bangkok run clock")
+    fri_utc = datetime(2026, 10, 30, 22, 17, tzinfo=timezone.utc)
+    sat_bkk = fri_utc.astimezone(BKK)
+    check("Friday 22:17 UTC is Saturday 05:17 in Bangkok",
+          sat_bkk.strftime("%Y-%m-%d %H:%M") == "2026-10-31 05:17")
+    check("same ISO week on both sides of the date line",
+          fri_utc.isocalendar()[:2] == sat_bkk.isocalendar()[:2])
+    rr = collect(hf, when=sat_bkk)
+    check("a Friday-night UTC run is filed under the Bangkok Saturday",
+          rr["date"] == "2026-10-31" and rr["iso_week"] == "2026-W44")
+    check("the run clock is UTC+7", run_clock().utcoffset() == timedelta(hours=7))
+
     print(f"\n{checks - len(problems)}/{checks} checks passed.")
     if problems:
         print("FAILED: " + "; ".join(problems), file=sys.stderr)
@@ -684,7 +1282,8 @@ def already_recorded(iso_week, rows):
 
 
 def collect(http=requests, when=None):
-    when = when or datetime.now(timezone.utc)
+    when = when or run_clock()
+    reset_run_state()
     y, w, _ = when.isocalendar()
     row = {k: "" for k in FIELDS}
     row["date"] = when.strftime("%Y-%m-%d")
@@ -695,6 +1294,8 @@ def collect(http=requests, when=None):
     fetch_quotes(row, http)
     fetch_nyfed(row, http)
     fetch_fred(row, http)
+    fetch_dated_brent(row, http, when)
+    fetch_contracts(row, http, when)
 
     row["sources_ok"] = len(successes)
     row["sources_failed"] = ";".join(failures)
@@ -719,7 +1320,22 @@ def main():
     if args.selftest:
         return selftest()
 
-    now = datetime.now(timezone.utc)
+    # Bring the record up to the current schema BEFORE anything reads or
+    # writes it. A dry run only reports what a real run would do.
+    try:
+        state = schema_state() if args.dry_run else migrate_schema()
+    except SchemaError as e:
+        print(f"Schema check failed - nothing collected or written. {e}",
+              file=sys.stderr)
+        return 1
+    if state == "migrated":
+        print(f"Migrated {CSV_PATH.name} to the {len(FIELDS)}-column schema; "
+              f"earlier weeks carry blanks in the new columns.")
+    elif state == "would-migrate":
+        print(f"Dry run: {CSV_PATH.name} would be migrated to the "
+              f"{len(FIELDS)}-column schema on a real run.")
+
+    now = run_clock()
     y, w, _ = now.isocalendar()
     iso_week = f"{y}-W{w:02d}"
     rows = read_rows()
@@ -736,7 +1352,7 @@ def main():
             return 0
         print(f"Repairing {iso_week}: {len(missing)} blank field(s) "
               f"-> {', '.join(missing)}")
-        merged, filled, still_blank = repair_week(iso_week, rows)
+        merged, filled, still_blank = repair_week(iso_week, rows, when=now)
         replace_week(merged)
         rows = write_block()
         print(f"Filled {len(filled)}: {', '.join(filled) or 'none'}. "
@@ -754,7 +1370,7 @@ def main():
         return 0
 
     print(f"Collecting for {iso_week} ...")
-    row = collect()
+    row = collect(when=now)
 
     if args.dry_run:
         print(json.dumps(row, indent=2, default=str))
