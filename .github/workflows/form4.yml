@@ -1,0 +1,75 @@
+name: Weekly insider clusters (Form 4)
+
+on:
+  schedule:
+    # Saturday 05:47 Bangkok = Friday 22:47 UTC, 30 minutes after the market
+    # series. Both workflows share one concurrency group, so they never push
+    # at the same time.
+    - cron: "47 22 * * 5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Collect and print without writing or committing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-series
+  cancel-in-progress: false
+
+jobs:
+  form4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90        # first run reads ~14 days of filings at 8 requests/s
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Self-test
+        run: python form4.py --selftest
+
+      - name: Fetch
+        env:
+          # SEC fair access: "Name contact@email". Lives only in this secret,
+          # never in the code. The script stops before any request without it.
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python form4.py --dry-run
+          else
+            python form4.py
+          fi
+
+      - name: Commit
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          set -euo pipefail
+          git config user.name  "series-bot"
+          git config user.email "series-bot@users.noreply.github.com"
+          git add data/insider-purchases.csv data/insider-clusters.csv data/insider-block.md data/form4-state.json
+          if git diff --staged --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "data: insider clusters $(TZ=Asia/Bangkok date +%G-W%V)"
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected on attempt $attempt - rebasing onto origin/${GITHUB_REF_NAME}"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+          done
+          echo "push still failing after 3 attempts" >&2
+          exit 1
