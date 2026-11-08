@@ -23,7 +23,7 @@ concurrency:
 jobs:
   form4:
     runs-on: ubuntu-latest
-    timeout-minutes: 90        # first run reads ~14 days of filings at 8 requests/s
+    timeout-minutes: 60        # the script stops itself at 40 min and saves; the next run continues
     steps:
       - uses: actions/checkout@v5
         with:
