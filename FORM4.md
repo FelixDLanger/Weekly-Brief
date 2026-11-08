@@ -1,4 +1,4 @@
-# Form 4 cluster feed
+# Form 4 cluster feed (v1.1)
 
 A second weekly job next to the market series. It reads SEC's daily form index, opens every Form 4, keeps **open-market purchases (transaction code P)**, and flags issuers where **two or more insiders bought within 14 days**. Each cluster gets its market cap (price x shares outstanding) and the date of its last 10-Q/10-K/20-F/40-F.
 
@@ -17,7 +17,7 @@ SEC's fair-access policy requires automated requests to identify themselves. Add
 
 It lives only in the secret. It is never in the code, never printed, and the script stops before making any request if it is missing or has no e-mail address.
 
-Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `33/33 checks passed`. The first real run reaches back 14 days.
+Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `39/39 checks passed`. The first real run reaches back 14 days.
 
 ## Rules built in
 
@@ -25,11 +25,13 @@ Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick d
 - Code P with "acquired" only. Sales, option exercises (M), gifts at zero price and the derivative table are ignored.
 - 4/A amendments are skipped (they restate earlier filings). Joint filers count once: the first reporting owner listed.
 - An index day is processed once. A missing day older than two days is a weekend or holiday; a missing recent day stops the walk and is retried next run.
-- A 403 from SEC stops the run and writes nothing.
+- A 403 on the **first** request means the secret is missing or rejected: the run stops and writes nothing.
+- A 403 **later** in the run is SEC's per-IP rate limit (shared with other users of the runner's address): the run saves every finished day and the next run continues.
+- **Time budget (v1.1):** the walk stops itself after 40 minutes (`FORM4_BUDGET_MIN`) at a day boundary and commits what it finished, so a long catch-up spreads over several runs instead of hitting the job timeout. One kept-alive connection to SEC instead of a new one per request.
 - Blank beats wrong: market cap or results date stay blank if a source does not answer.
 
 ```bash
-python form4.py --selftest   # 33 checks, offline
+python form4.py --selftest   # 39 checks, offline
 python form4.py --dry-run    # needs SEC_USER_AGENT; writes nothing
 ```
 
