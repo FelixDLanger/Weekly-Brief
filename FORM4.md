@@ -17,7 +17,7 @@ SEC's fair-access policy requires automated requests to identify themselves. Add
 
 It lives only in the secret. It is never in the code, never printed, and the script stops before making any request if it is missing or has no e-mail address.
 
-Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `42/42 checks passed`. The first real run reaches back 14 days.
+Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `45/45 checks passed`. The first real run reaches back 14 days.
 
 ## Rules built in
 
@@ -29,10 +29,11 @@ Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick d
 - A 403 on the **first** request means the secret is missing or rejected: the run stops, writes nothing, and prints the start of SEC's reply (the User-Agent blanked out) so the log shows why.
 - A 403 **later** in the run is SEC's per-IP rate limit (shared with other users of the runner's address): the run saves every finished day and the next run continues.
 - **Time budget (v1.1):** the walk stops itself after 40 minutes (`FORM4_BUDGET_MIN`) at a day boundary and commits what it finished, so a long catch-up spreads over several runs instead of hitting the job timeout. One kept-alive connection to SEC instead of a new one per request.
-- Blank beats wrong: market cap or results date stay blank if a source does not answer.
+- Each filing is counted once. The daily index lists it under the issuer's and under every insider's folder, so filings are matched by accession number, not by path.
+- Blank beats wrong: market cap or results date stay blank if a source does not answer. Market cap is also blank for 20-F/40-F filers, whose US price is usually per ADR while the share count is ordinary shares.
 
 ```bash
-python form4.py --selftest   # 42 checks, offline
+python form4.py --selftest   # 45 checks, offline
 python form4.py --dry-run    # needs SEC_USER_AGENT; writes nothing
 ```
 

@@ -180,8 +180,10 @@ def index_url(day):
 
 
 def parse_form_index(text):
-    """Form 4 entries from a daily form.idx, one per filing (a filing is
-    listed once for the issuer and once for each reporting owner)."""
+    """Form 4 entries from a daily form.idx, one per filing. A filing is
+    listed once for the issuer and once for each reporting owner, each time
+    under that filer's own folder (edgar/data/<cik>/<accession>.txt), so the
+    paths differ and only the accession number identifies the filing."""
     out, seen, body = [], set(), False
     for line in text.splitlines():
         if not body:
@@ -191,12 +193,13 @@ def parse_form_index(text):
         if not m or m.group(1).strip() != "4":
             continue
         path = m.group(5)
-        if path in seen:
+        accession = path.rsplit("/", 1)[-1].replace(".txt", "")
+        if accession in seen:
             continue
-        seen.add(path)
+        seen.add(accession)
         d = m.group(4)
         out.append({"path": path, "filed": f"{d[:4]}-{d[4:6]}-{d[6:]}",
-                    "accession": path.rsplit("/", 1)[-1].replace(".txt", "")})
+                    "accession": accession})
     return out
 
 
@@ -314,9 +317,15 @@ def read_state():
 
 
 def merge_purchases(existing, new):
-    """Union keyed by (accession, line). Existing rows are never changed."""
+    """Union keyed by (accession, line). Existing rows are never changed, and
+    a transaction seen twice in one run is added once."""
     keys = {(r["accession"], str(r["line"])) for r in existing}
-    added = [r for r in new if (r["accession"], str(r["line"])) not in keys]
+    added = []
+    for r in new:
+        k = (r["accession"], str(r["line"]))
+        if k not in keys:
+            keys.add(k)
+            added.append(r)
     merged = existing + added
     merged.sort(key=lambda r: (r["txn_date"], r["accession"], int(r["line"])))
     return merged, added
@@ -356,7 +365,7 @@ def find_clusters(purchases, as_of, days=WINDOW_DAYS, min_insiders=MIN_INSIDERS)
             "value": round(sum(_f(r["value"]) for r in rows), 2),
             "first_buy": min(r["txn_date"] for r in rows),
             "last_buy": max(r["txn_date"] for r in rows),
-            "roles": " | ".join(roles),
+            "roles": " / ".join(roles),
             "market_cap": "", "last_results": "", "last_results_form": "",
         })
     out.sort(key=lambda c: (-c["insiders"], -c["value"]))
@@ -397,7 +406,11 @@ def enrich(cluster, sec, http=None):
                 price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
         except Exception:
             price = None
-    if shares and price:
+    # Foreign issuers (20-F/40-F) usually trade in the US as ADRs: the Yahoo
+    # price is per ADR, the share count is ordinary shares, and the product
+    # can be off by the ADR ratio (Pampa showed $88bn). Blank beats wrong.
+    foreign = cluster.get("last_results_form") in ("20-F", "40-F")
+    if shares and price and not foreign:
         cluster["market_cap"] = round(shares * price)
     return cluster
 
@@ -411,6 +424,11 @@ def _money(v):
     if x >= 1e6:
         return f"${x/1e6:,.1f}m"
     return f"${x:,.0f}"
+
+
+def _cell(v):
+    """Table cell text: a "|" would split the Markdown row into extra columns."""
+    return str(v).replace("|", "/").replace("\n", " ").strip()
 
 
 def render_block(clusters, as_of, days=WINDOW_DAYS, scanned=None, stopped=None):
@@ -432,8 +450,9 @@ def render_block(clusters, as_of, days=WINDOW_DAYS, scanned=None, stopped=None):
             name = f"{c['issuer_name']} ({c['ticker']})" if c["ticker"] else c["issuer_name"]
             res = (f"{c['last_results']} {c['last_results_form']}"
                    if c["last_results"] else "n/a")
-            out.append(f"| {name} | {c['insiders']} | {c['purchases']} | "
-                       f"{_money(c['value'])} | {_money(c['market_cap'])} | {res} | {c['roles']} |")
+            cells = [name, c["insiders"], c["purchases"], _money(c["value"]),
+                     _money(c["market_cap"]), res, c["roles"]]
+            out.append("| " + " | ".join(_cell(x) for x in cells) + " |")
         out.append("")
     note = f"{scanned} Form 4 filings read this run. " if scanned is not None else ""
     if stopped:
@@ -706,7 +725,8 @@ def selftest():
     }
     idx = {
         "20261029": _index("20261029", [
-            ("4", "ACME CORP", "111", p_a1), ("4", "DOE JANE", "5001", p_a1),
+            ("4", "ACME CORP", "111", p_a1),
+            ("4", "DOE JANE", "5001", "edgar/data/5001/0000111-26-000001.txt"),
             ("4", "ACME CORP", "111", p_a2), ("4/A", "ACME CORP", "111", p_amend),
             ("8-K", "ACME CORP", "111", "edgar/data/111/0000111-26-000009.txt")]),
         "20261030": _index("20261030", [
@@ -780,6 +800,26 @@ def selftest():
     again, added2 = merge_purchases(read_csv(PURCHASES), new_rows)
     check("idempotent: the same filings add nothing on a rerun",
           added2 == [] and len(again) == len(merged))
+    twice, added3 = merge_purchases([], new_rows + new_rows)
+    check("a transaction read twice in one run is counted once",
+          len(twice) == len(new_rows) and len(added3) == len(new_rows))
+    many = dict(c0, roles=" / ".join(["Director", "Officer (CFO)"]), issuer_name="A|B Corp")
+    row = [l for l in render_block([many], as_of).splitlines() if l.startswith("| A")][0]
+    check("block: several roles and a '|' in a name keep the row at 7 columns",
+          row.count("|") == 8 and "Director / Officer (CFO)" in row)
+
+    class _Foreign(_FakeHTTP):
+        def get(self, url, **k):
+            if "submissions" in url:
+                self.seen_headers.append(k.get("headers") or {})
+                return _R(200, json.dumps({"filings": {"recent": {
+                    "form": ["6-K", "20-F"], "filingDate": ["2026-10-29", "2026-04-30"]}}}))
+            return super().get(url, **k)
+
+    fh = _Foreign(docs, idx)
+    cf = enrich(dict(clusters[0]), SecClient("Test Bot test@example.com", http=fh, sleep=lambda s: None), http=fh)
+    check("enrich: a 20-F filer (likely ADR) gets no market cap, results date kept",
+          cf["market_cap"] == "" and cf["last_results_form"] == "20-F")
     blk = render_block([c0], as_of, scanned=scanned)
     check("block: names the window", "2026-10-17 to 2026-10-30" in blk)
     check("block: cluster row with money formats",
