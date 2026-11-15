@@ -33,6 +33,7 @@ Design rules:
 
 import argparse
 import csv
+import html
 import io
 import json
 import os
@@ -88,6 +89,20 @@ class SecThrottled(RuntimeError):
     Not fatal - the run saves what it finished and the next run continues."""
 
 
+def _refusal_excerpt(resp, ua, limit=400):
+    """The start of SEC's 403 page as plain text, so the log shows why SEC
+    refused (e.g. "Undeclared Automated Tool" vs an address block). The
+    User-Agent (the secret) is blanked out if SEC echoes it."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", getattr(resp, "text", "") or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    if ua:
+        text = text.replace(ua, "[User-Agent]")
+    text = re.sub(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", "[e-mail]", text)
+    text = " ".join(text.split())[:limit]
+    return f"\nSEC's reply: {text}" if text else "\nSEC's reply was empty."
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -125,7 +140,8 @@ class SecClient:
                 if self.answered == 0:
                     raise SecRefused(
                         "SEC returned 403 to the first request. The SEC_USER_AGENT "
-                        "secret is missing or not accepted. Nothing was written.")
+                        "secret is missing or not accepted. Nothing was written."
+                        + _refusal_excerpt(r, self.headers["User-Agent"]))
                 raise SecThrottled("SEC returned 403 mid-run (rate limit)")
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                 self.sleep(2 + 3 * attempt)
@@ -566,8 +582,9 @@ class _R:
 
 
 class _FakeHTTP:
-    def __init__(self, docs, indexes, refuse=False):
+    def __init__(self, docs, indexes, refuse=False, refuse_text=""):
         self.docs, self.indexes, self.refuse = docs, indexes, refuse
+        self.refuse_text = refuse_text
         self.seen_headers = []
         self.urls = []
 
@@ -575,7 +592,7 @@ class _FakeHTTP:
         self.seen_headers.append(headers or {})
         self.urls.append(url)
         if self.refuse:
-            return _R(403)
+            return _R(403, self.refuse_text)
         if "daily-index" in url:
             key = url.rsplit("form.", 1)[1][:8]
             return _R(200, self.indexes[key]) if key in self.indexes else _R(404)
@@ -778,6 +795,18 @@ def selftest():
         check("403 on the very first request is still fatal (bad User-Agent)", False)
     except SecRefused:
         check("403 on the very first request is still fatal (bad User-Agent)", True)
+    page = ("<html><head><style>p{}</style></head><body><h1>Your Request Originates from "
+            "an Undeclared Automated Tool</h1><p>UA seen: Test Bot test@example.com &amp; more</p></body></html>")
+    why = SecClient("Test Bot test@example.com", http=_FakeHTTP({}, {}, refuse=True, refuse_text=page),
+                    sleep=lambda s: None)
+    try:
+        why.get("https://www.sec.gov/x")
+        msg = ""
+    except SecRefused as e:
+        msg = str(e)
+    check("first-request 403 prints SEC's reason, never the User-Agent",
+          "Undeclared Automated Tool" in msg and "test@example.com" not in msg
+          and "<h1>" not in msg and "p{}" not in msg)
     tick = [0.0]
     def slow_clock():
         tick[0] += 1000.0
