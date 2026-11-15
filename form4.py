@@ -89,6 +89,15 @@ class SecThrottled(RuntimeError):
     Not fatal - the run saves what it finished and the next run continues."""
 
 
+def _is_missing_file(url, resp):
+    """True for S3's own 403 on an /Archives/ path: an XML error with
+    <Code>AccessDenied</Code> or <Code>NoSuchKey</Code>. SEC's User-Agent
+    refusal and its rate-limit page are HTML and do not match."""
+    body = (getattr(resp, "text", "") or "")[:2000]
+    return ("/Archives/" in url
+            and re.search(r"<Code>\s*(AccessDenied|NoSuchKey)\s*</Code>", body) is not None)
+
+
 def _refusal_excerpt(resp, ua, limit=400):
     """The start of SEC's 403 page as plain text, so the log shows why SEC
     refused (e.g. "Undeclared Automated Tool" vs an address block). The
@@ -136,6 +145,12 @@ class SecClient:
             self._last = self.clock()
             self.calls += 1
             r = self.http.get(url, headers=self.headers, timeout=TIMEOUT)
+            if r.status_code == 403 and _is_missing_file(url, r):
+                # SEC's archive sits on S3, which answers a file that does not
+                # exist (a weekend's daily index) with an S3 "AccessDenied" 403
+                # instead of 404. That is a normal "not there" answer.
+                self.answered += 1
+                return 404, r.text
             if r.status_code == 403:
                 if self.answered == 0:
                     raise SecRefused(
@@ -807,6 +822,27 @@ def selftest():
     check("first-request 403 prints SEC's reason, never the User-Agent",
           "Undeclared Automated Tool" in msg and "test@example.com" not in msg
           and "<h1>" not in msg and "p{}" not in msg)
+    s3_missing = ('<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code>'
+                  '<Message>Access Denied</Message><RequestId>X</RequestId><HostId>Y</HostId></Error>')
+
+    class _WeekendS3(_FakeHTTP):
+        def get(self, url, **k):
+            if "daily-index" in url and url.rsplit("form.", 1)[1][:8] not in self.indexes:
+                self.seen_headers.append(k.get("headers") or {})
+                return _R(403, s3_missing)
+            return super().get(url, **k)
+
+    wk = SecClient("Test Bot test@example.com", http=_WeekendS3(docs, idx), sleep=lambda s: None)
+    rows_w, last_w, _, stop_w = collect(wk, {"last_index_day": "2026-10-24"}, today, log=lambda m: None)
+    check("S3 'AccessDenied' for a missing weekend index is a missing day, not a refusal",
+          stop_w is None and last_w is not None and last_w >= "2026-10-30" and len(rows_w) == 5)
+    ua_page = SecClient("Test Bot test@example.com",
+                        http=_FakeHTTP({}, {}, refuse=True, refuse_text=page), sleep=lambda s: None)
+    try:
+        ua_page.get(index_url(date(2026, 11, 2)))
+        check("SEC's HTML refusal page on an index URL is still fatal", False)
+    except SecRefused:
+        check("SEC's HTML refusal page on an index URL is still fatal", True)
     tick = [0.0]
     def slow_clock():
         tick[0] += 1000.0

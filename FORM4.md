@@ -17,7 +17,7 @@ SEC's fair-access policy requires automated requests to identify themselves. Add
 
 It lives only in the secret. It is never in the code, never printed, and the script stops before making any request if it is missing or has no e-mail address.
 
-Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `40/40 checks passed`. The first real run reaches back 14 days.
+Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick dry run.** The Self-test step should print `42/42 checks passed`. The first real run reaches back 14 days.
 
 ## Rules built in
 
@@ -25,13 +25,14 @@ Then: **Actions → Weekly insider clusters (Form 4) → Run workflow → tick d
 - Code P with "acquired" only. Sales, option exercises (M), gifts at zero price and the derivative table are ignored.
 - 4/A amendments are skipped (they restate earlier filings). Joint filers count once: the first reporting owner listed.
 - An index day is processed once. A missing day older than two days is a weekend or holiday; a missing recent day stops the walk and is retried next run.
+- A missing daily index (weekend, holiday) comes back from SEC's S3 storage as a 403 `AccessDenied` XML error, not a 404. The script reads that as "no file", not as a refusal.
 - A 403 on the **first** request means the secret is missing or rejected: the run stops, writes nothing, and prints the start of SEC's reply (the User-Agent blanked out) so the log shows why.
 - A 403 **later** in the run is SEC's per-IP rate limit (shared with other users of the runner's address): the run saves every finished day and the next run continues.
 - **Time budget (v1.1):** the walk stops itself after 40 minutes (`FORM4_BUDGET_MIN`) at a day boundary and commits what it finished, so a long catch-up spreads over several runs instead of hitting the job timeout. One kept-alive connection to SEC instead of a new one per request.
 - Blank beats wrong: market cap or results date stay blank if a source does not answer.
 
 ```bash
-python form4.py --selftest   # 40 checks, offline
+python form4.py --selftest   # 42 checks, offline
 python form4.py --dry-run    # needs SEC_USER_AGENT; writes nothing
 ```
 
